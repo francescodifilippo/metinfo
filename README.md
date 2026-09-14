@@ -164,6 +164,57 @@ This program is provided as-is, without any express or implied warranty.
 
 ---
 
+## metrepair (companion tool)
+
+### Description
+`metrepair` is a companion program, built alongside `metinfo`, that reproduces the core - purely local - part of what repair tools like MetMedic do for corrupted `.part.met` files: given the correct per-block MD4 hashes of a download (a "reference") and the actual downloaded data (a `.part` file), it re-hashes every block, tells you which ones are intact, and can write a brand new, valid `.part.met` with correct Gap/Filename/Filesize tags.
+
+**It never contacts any eDonkey/eMule server or peer.** You still need to obtain the reference block hashes yourself first - typically by re-adding the same download once in eMule/aMule (which recreates a fresh, correctly hashed but 0%-downloaded `.part.met` from the network) - or from an `ed2k://` link that already embeds a `p=hash1:hash2:...` part-hash parameter.
+
+### Usage
+```bash
+# Check which blocks of a .part file are actually intact, without writing anything
+./metrepair verify --ref /path/to/good.part.met --data /path/to/corrupted.part
+
+# Same, but using an ed2k link with a p= hash-set instead of a .part.met file
+./metrepair verify --ref "ed2k://|file|movie.mkv|1234567|<hash>|p=<h1>:<h2>:.../|" --data /path/to/corrupted.part
+
+# Rebuild a valid .part.met from the reference hashes and the corrupted data
+./metrepair rebuild --ref /path/to/good.part.met --data /path/to/corrupted.part -o /path/to/fixed.part.met
+
+# JSON output, for scripting
+./metrepair verify --ref /path/to/good.part.met --data /path/to/corrupted.part --json
+```
+
+After `rebuild`, place your data file next to the new `.part.met`, named the same way but without `.met` (e.g. `1.part.met` needs a sibling `1.part`), then resume the download in eMule/aMule as usual.
+
+### How It Works
+1. Reads the reference's per-block MD4 hash array, ID hash, filename and filesize - either from a `.part.met` file (any of the versions `metinfo` understands: 14.0, 14.1, or the large-file 0xE2 variant) or from an `ed2k://` link's `p=` parameter.
+2. Splits the `.part` data file into the same 9,728,000-byte blocks used by the `.part.met` format, computes the MD4 of each one (a from-scratch RFC 1320 implementation, since MD4 isn't in the standard C library), and compares it to the reference.
+3. Merges contiguous mismatched/missing blocks into Gap ranges.
+4. In `rebuild` mode, writes a new `.part.met` (14.0-compatible layout) with the correct ID hash, block hash array, Filename/Filesize/Transferred tags, and the freshly computed Gap tags.
+
+Before doing any of this, `metrepair` runs its MD4 implementation against the standard RFC 1320 test vectors and refuses to proceed if they don't match - correctness there is the whole point of the tool.
+
+### Command Line Options
+```
+  verify  --ref <file.part.met|ed2k-link> --data <file.part> [--json]
+  rebuild --ref <file.part.met|ed2k-link> --data <file.part> -o <out.part.met> [--force] [--json]
+  -h, --help       Show help
+  -V, --version    Show version
+
+  -r, --ref=REF        Reference: a .part.met file, or an ed2k link with p=...
+  -d, --data=FILE      The .part file to verify/repair
+  -o, --output=FILE    Where to write the rebuilt .part.met (rebuild only)
+  -F, --force          Overwrite the output file if it already exists
+  -j, --json            Output in JSON format
+```
+
+### License
+This program is provided as-is, without any express or implied warranty.
+
+---
+
 ## Latin
 
 ### Descriptio
@@ -223,6 +274,14 @@ Omnis informatio potest in forma JSON produci:
 # Unius valoris exitus JSON
 ./metinfo -f /via/ad/documentum.part.met -e -j
 # Exitus: {"ed2k_hash":"E7D81234AB56C890DEF12345ABC67890"}
+```
+
+### metrepair
+`metrepair` est instrumentum additum quod partem localem instrumentorum reparationis (ut MetMedic) sine ulla conexione ad retem eDonkey/eMule praestat: datis tesseris MD4 correctis (ex documento `.part.met` bono, vel ex nexu `ed2k://` cum parametro `p=`) et documento `.part` corrupto, quodque frustum iterum tesserat, frusta integra a corruptis distinguit, et novum documentum `.part.met` validum scribere potest.
+
+```bash
+./metrepair verify  --ref /via/ad/bonum.part.met --data /via/ad/corruptum.part
+./metrepair rebuild --ref /via/ad/bonum.part.met --data /via/ad/corruptum.part -o /via/ad/emendatum.part.met
 ```
 
 ### Licentia
@@ -363,6 +422,57 @@ Altre opzioni:
   -V, --version        Mostra la versione del programma
   -z, --visualize      Visualizza lo stato del download
   -h, --help           Mostra questo messaggio di aiuto
+```
+
+### Licenza
+Questo programma viene fornito così com'è, senza alcuna garanzia espressa o implicita.
+
+---
+
+## metrepair (strumento complementare)
+
+### Descrizione
+`metrepair` è un programma complementare, compilato insieme a `metinfo`, che replica la parte centrale - e puramente locale - di ciò che fanno strumenti di riparazione come MetMedic per i file `.part.met` corrotti: dati gli hash MD4 corretti per blocco di un download (un "riferimento") e i dati effettivamente scaricati (un file `.part`), ricalcola l'hash di ogni blocco, indica quali sono integri e può scrivere un nuovo `.part.met` valido con i tag Gap/Filename/Filesize corretti.
+
+**Non contatta mai alcun server o peer eDonkey/eMule.** Gli hash di riferimento per blocco vanno comunque ottenuti prima in altro modo - tipicamente ri-aggiungendo una volta lo stesso download in eMule/aMule (che ricrea dalla rete un `.part.met` fresco, con hash corretti ma 0% scaricato) - oppure da un link `ed2k://` che include già un parametro `p=hash1:hash2:...`.
+
+### Utilizzo
+```bash
+# Verifica quali blocchi di un file .part sono realmente integri, senza scrivere nulla
+./metrepair verify --ref /percorso/al/buono.part.met --data /percorso/al/corrotto.part
+
+# Come sopra, ma usando un link ed2k con hash-set p= invece di un file .part.met
+./metrepair verify --ref "ed2k://|file|film.mkv|1234567|<hash>|p=<h1>:<h2>:.../|" --data /percorso/al/corrotto.part
+
+# Ricostruisce un .part.met valido a partire dagli hash di riferimento e dai dati corrotti
+./metrepair rebuild --ref /percorso/al/buono.part.met --data /percorso/al/corrotto.part -o /percorso/al/riparato.part.met
+
+# Output JSON, per script
+./metrepair verify --ref /percorso/al/buono.part.met --data /percorso/al/corrotto.part --json
+```
+
+Dopo `rebuild`, posiziona il file dati accanto al nuovo `.part.met`, con lo stesso nome ma senza `.met` (es. `1.part.met` richiede un `1.part` accanto), poi riprendi il download in eMule/aMule come di consueto.
+
+### Come funziona
+1. Legge l'array di hash MD4 per blocco, l'hash ID, il nome file e la dimensione dal riferimento - sia da un file `.part.met` (in qualsiasi versione compresa da `metinfo`: 14.0, 14.1 o la variante large-file 0xE2), sia dal parametro `p=` di un link `ed2k://`.
+2. Divide il file dati `.part` negli stessi blocchi da 9.728.000 byte usati dal formato `.part.met`, calcola l'MD4 di ciascuno (implementazione da zero secondo RFC 1320, dato che MD4 non è nella libreria standard C) e lo confronta col riferimento.
+3. Unisce i blocchi contigui mancanti/non corrispondenti in intervalli Gap.
+4. In modalità `rebuild`, scrive un nuovo `.part.met` (formato compatibile 14.0) con l'hash ID corretto, l'array di hash per blocco, i tag Filename/Filesize/Transferred e i tag Gap appena calcolati.
+
+Prima di fare tutto questo, `metrepair` testa la propria implementazione MD4 contro i vettori di test standard RFC 1320 e si rifiuta di procedere se non corrispondono - la correttezza qui è l'intero scopo dello strumento.
+
+### Opzioni della Linea di Comando
+```
+  verify  --ref <file.part.met|link-ed2k> --data <file.part> [--json]
+  rebuild --ref <file.part.met|link-ed2k> --data <file.part> -o <out.part.met> [--force] [--json]
+  -h, --help       Mostra l'aiuto
+  -V, --version    Mostra la versione
+
+  -r, --ref=REF        Riferimento: un file .part.met, o un link ed2k con p=...
+  -d, --data=FILE      Il file .part da verificare/riparare
+  -o, --output=FILE    Dove scrivere il .part.met ricostruito (solo rebuild)
+  -F, --force          Sovrascrive il file di output se già esistente
+  -j, --json            Output in formato JSON
 ```
 
 ### Licenza

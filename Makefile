@@ -1,24 +1,30 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -Werror -pedantic -std=c99 -O2
 LDFLAGS =
-EXECUTABLE = metinfo
+EXECUTABLES = metinfo metrepair
 
 .PHONY: all clean install uninstall
 
-all: $(EXECUTABLE)
+all: $(EXECUTABLES)
 
-$(EXECUTABLE): metinfo.o
+metinfo: metinfo.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+metrepair: metrepair.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
 metinfo.o: metinfo.c
 	$(CC) $(CFLAGS) -c $<
 
+metrepair.o: metrepair.c
+	$(CC) $(CFLAGS) -c $<
+
 clean:
-	rm -f $(EXECUTABLE) *.o
+	rm -f $(EXECUTABLES) *.o
 
 install: all
 	install -d $(DESTDIR)/usr/local/bin
-	install -m 755 $(EXECUTABLE) $(DESTDIR)/usr/local/bin
+	install -m 755 $(EXECUTABLES) $(DESTDIR)/usr/local/bin
 
 uninstall:
-	rm -f $(DESTDIR)/usr/local/bin/$(EXECUTABLE)
+	rm -f $(addprefix $(DESTDIR)/usr/local/bin/,$(EXECUTABLES))
