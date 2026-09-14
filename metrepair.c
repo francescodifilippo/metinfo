@@ -34,33 +34,22 @@
 #include <strings.h>
 #include <time.h>
 
+#include "metfmt.h"
+
 /* ------------------------------------------------------------------ */
 /* Constants                                                          */
 /* ------------------------------------------------------------------ */
 
 #define PARTSIZE 9728000ULL /* bytes per block, per the .part.met format */
 
-#define TAGTYPE_HASH16    0x01
-#define TAGTYPE_STRING    0x02
-#define TAGTYPE_UINT32    0x03
-#define TAGTYPE_FLOAT32   0x04
-#define TAGTYPE_BOOL      0x05
-#define TAGTYPE_BOOLARRAY 0x06
-#define TAGTYPE_BLOB      0x07
-#define TAGTYPE_UINT16    0x08
-#define TAGTYPE_UINT8     0x09
-#define TAGTYPE_BSOB      0x0A
-#define TAGTYPE_UINT64    0x0B
-#define TAGTYPE_STR1      0x11
-#define TAGTYPE_STR16     0x20
-
-#define FT_FILENAME    1
-#define FT_FILESIZE    2
-#define FT_TRANSFERRED 8
-
-#define PARTFILE_VERSION_14_0      224 /* 0xE0 */
-#define PARTFILE_VERSION_14_1      225 /* 0xE1 */
-#define PARTFILE_VERSION_LARGEFILE 226 /* 0xE2 */
+/**
+ * Number of blocks a file of this size is split into (ceil(filesize / PARTSIZE)).
+ */
+static unsigned int blocksForSize(unsigned long long filesize) {
+    unsigned int n = (unsigned int)(filesize / PARTSIZE);
+    if (filesize % PARTSIZE != 0) n++;
+    return n;
+}
 
 /* ------------------------------------------------------------------ */
 /* MD4 (RFC 1320 reference algorithm; not part of the standard libc)  */
@@ -228,103 +217,96 @@ static void md4SelfTest(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Low-level file I/O helpers (same wire format as metinfo.c)         */
+/* Growable output buffer: the rebuilt .part.met is assembled here    */
+/* in memory and flushed with a single write(2), instead of one      */
+/* syscall per field.                                                */
 /* ------------------------------------------------------------------ */
 
-static unsigned char readByte(int fd) {
-    unsigned char byte;
-    if (read(fd, &byte, 1) != 1) {
-        err(EXIT_FAILURE, "Error reading file");
-    }
-    return byte;
+typedef struct {
+    unsigned char *data;
+    size_t len;
+    size_t cap;
+} ByteBuf;
+
+static void bufInit(ByteBuf *b) {
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
 }
 
-static unsigned short readWord(int fd) {
-    unsigned char b[2];
-    if (read(fd, b, 2) != 2) {
-        err(EXIT_FAILURE, "Error reading file");
-    }
-    return (unsigned short)(b[0] | (b[1] << 8));
+static void bufFree(ByteBuf *b) {
+    free(b->data);
 }
 
-static unsigned int readDWord(int fd) {
-    unsigned char b[4];
-    if (read(fd, b, 4) != 4) {
-        err(EXIT_FAILURE, "Error reading file");
-    }
-    return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24));
-}
-
-static unsigned long long readQWord(int fd) {
-    unsigned char b[8];
-    if (read(fd, b, 8) != 8) {
-        err(EXIT_FAILURE, "Error reading file");
-    }
-    unsigned long long v = 0;
-    for (int i = 7; i >= 0; i--) {
-        v = (v << 8) | b[i];
-    }
-    return v;
-}
-
-static void readBytes(int fd, unsigned char *buf, size_t len) {
-    if (len == 0) return;
-    ssize_t got = read(fd, buf, len);
-    if (got < 0 || (size_t)got != len) {
-        err(EXIT_FAILURE, "Error reading file");
-    }
-}
-
-static char *readString(int fd, unsigned int len) {
-    char *s = (char *)malloc(len + 1);
-    if (s == NULL) {
+static void bufReserve(ByteBuf *b, size_t extra) {
+    if (b->len + extra <= b->cap) return;
+    size_t newCap = b->cap ? b->cap * 2 : 4096;
+    while (newCap < b->len + extra) newCap *= 2;
+    unsigned char *newData = realloc(b->data, newCap);
+    if (newData == NULL) {
         err(EXIT_FAILURE, "Memory allocation error");
     }
-    readBytes(fd, (unsigned char *)s, len);
-    s[len] = '\0';
-    return s;
+    b->data = newData;
+    b->cap = newCap;
 }
 
-static void writeByte(int fd, unsigned char v) {
-    if (write(fd, &v, 1) != 1) {
-        err(EXIT_FAILURE, "Error writing output file");
-    }
+static void bufAppend(ByteBuf *b, const void *src, size_t n) {
+    bufReserve(b, n);
+    memcpy(b->data + b->len, src, n);
+    b->len += n;
 }
 
-static void writeWord(int fd, unsigned short v) {
-    unsigned char b[2] = { (unsigned char)(v & 0xff), (unsigned char)((v >> 8) & 0xff) };
-    if (write(fd, b, 2) != 2) {
-        err(EXIT_FAILURE, "Error writing output file");
-    }
+static void bufByte(ByteBuf *b, unsigned char v) {
+    bufAppend(b, &v, 1);
 }
 
-static void writeDWord(int fd, unsigned int v) {
-    unsigned char b[4] = {
-        (unsigned char)(v & 0xff), (unsigned char)((v >> 8) & 0xff),
-        (unsigned char)((v >> 16) & 0xff), (unsigned char)((v >> 24) & 0xff)
-    };
-    if (write(fd, b, 4) != 4) {
-        err(EXIT_FAILURE, "Error writing output file");
-    }
+static void bufWord(ByteBuf *b, unsigned short v) {
+    unsigned char t[2] = { (unsigned char)(v & 0xff), (unsigned char)((v >> 8) & 0xff) };
+    bufAppend(b, t, 2);
 }
 
-static void writeQWord(int fd, unsigned long long v) {
-    unsigned char b[8];
-    for (int i = 0; i < 8; i++) {
-        b[i] = (unsigned char)(v & 0xff);
+static void bufDWord(ByteBuf *b, unsigned int v) {
+    unsigned char t[4];
+    for (int i = 0; i < 4; i++) {
+        t[i] = (unsigned char)(v & 0xff);
         v >>= 8;
     }
-    if (write(fd, b, 8) != 8) {
+    bufAppend(b, t, 4);
+}
+
+static void bufDWordAt(ByteBuf *b, size_t pos, unsigned int v) {
+    for (int i = 0; i < 4; i++) {
+        b->data[pos + (size_t)i] = (unsigned char)(v & 0xff);
+        v >>= 8;
+    }
+}
+
+static void bufQWord(ByteBuf *b, unsigned long long v) {
+    unsigned char t[8];
+    for (int i = 0; i < 8; i++) {
+        t[i] = (unsigned char)(v & 0xff);
+        v >>= 8;
+    }
+    bufAppend(b, t, 8);
+}
+
+static void bufFlushToFile(ByteBuf *b, int fd) {
+    if (b->len == 0) return;
+    ssize_t w = write(fd, b->data, b->len);
+    if (w < 0 || (size_t)w != b->len) {
         err(EXIT_FAILURE, "Error writing output file");
     }
 }
 
-static void writeBytes(int fd, const unsigned char *buf, size_t len) {
-    if (len == 0) return;
-    ssize_t w = write(fd, buf, len);
-    if (w < 0 || (size_t)w != len) {
-        err(EXIT_FAILURE, "Error writing output file");
+/* strdup() is POSIX, not standard C99; provide our own to stay -std=c99 clean */
+static char *ownStrdup(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *copy = (char *)malloc(len);
+    if (copy == NULL) {
+        err(EXIT_FAILURE, "Memory allocation error");
     }
+    memcpy(copy, s, len);
+    return copy;
 }
 
 /* ------------------------------------------------------------------ */
@@ -345,99 +327,29 @@ static void freeRefInfo(RefInfo *r) {
 }
 
 /**
- * Read (and mostly discard) the tags of a .part.met file, capturing
- * only the FILENAME and FILESIZE special tags. Reused for every
- * .part.met version, since the tag encoding itself is identical; only
- * where the tag list sits in the file differs.
+ * Read the tags of a .part.met file via the shared readMetaTag() parser,
+ * capturing only the FILENAME and FILESIZE special tags and discarding
+ * the rest. Reused for every .part.met version, since the tag encoding
+ * itself is identical; only where the tag list sits in the file differs.
  */
-static void readAndExtractTags(int fd, unsigned int numTags, char **outFilename, unsigned long long *outFilesize) {
+static void extractRefTags(int fd, unsigned int numTags, char **outFilename, unsigned long long *outFilesize) {
     for (unsigned int i = 0; i < numTags; i++) {
-        int type = readByte(fd);
-        unsigned int nameLen = readWord(fd);
-        unsigned char nameId = 0;
-        char *name = NULL;
-        if (nameLen == 1) {
-            nameId = readByte(fd);
-        } else {
-            name = readString(fd, nameLen);
+        MetaTag *tag = readMetaTag(fd);
+        if (tag == NULL) {
+            errx(EXIT_FAILURE, "Unrecognized tag type while reading reference .part.met");
         }
 
-        unsigned long long ival = 0;
-        char *sval = NULL;
-
-        switch (type) {
-            case TAGTYPE_HASH16: {
-                unsigned char h[16];
-                readBytes(fd, h, 16);
-                break;
-            }
-            case TAGTYPE_STRING: {
-                unsigned int len = readWord(fd);
-                sval = readString(fd, len);
-                break;
-            }
-            case TAGTYPE_UINT8:
-                ival = readByte(fd);
-                break;
-            case TAGTYPE_UINT16:
-                ival = readWord(fd);
-                break;
-            case TAGTYPE_UINT32:
-                ival = readDWord(fd);
-                break;
-            case TAGTYPE_UINT64:
-                ival = readQWord(fd);
-                break;
-            case TAGTYPE_BOOL:
-                ival = readByte(fd);
-                break;
-            case TAGTYPE_FLOAT32: {
-                unsigned char b[4];
-                readBytes(fd, b, 4);
-                break;
-            }
-            case TAGTYPE_BOOLARRAY: {
-                unsigned short bitLen = readWord(fd);
-                if (lseek(fd, (bitLen / 8) + 1, SEEK_CUR) == (off_t)-1) {
-                    err(EXIT_FAILURE, "Error seeking within reference file");
-                }
-                break;
-            }
-            case TAGTYPE_BLOB: {
-                unsigned int blobLen = readDWord(fd);
-                if (lseek(fd, blobLen, SEEK_CUR) == (off_t)-1) {
-                    err(EXIT_FAILURE, "Error seeking within reference file");
-                }
-                break;
-            }
-            case TAGTYPE_BSOB: {
-                unsigned char bsobLen = readByte(fd);
-                if (lseek(fd, bsobLen, SEEK_CUR) == (off_t)-1) {
-                    err(EXIT_FAILURE, "Error seeking within reference file");
-                }
-                break;
-            }
-            default:
-                if (type >= TAGTYPE_STR1 && type <= TAGTYPE_STR16) {
-                    int len = type - TAGTYPE_STR1 + 1;
-                    sval = readString(fd, (unsigned int)len);
-                } else {
-                    errx(EXIT_FAILURE, "Unrecognized tag type 0x%02X while reading reference .part.met", type);
-                }
-        }
-
-        if (nameLen == 1) {
-            if (nameId == FT_FILENAME && sval != NULL) {
+        if (tag->nameLength == 1) {
+            unsigned char nameId = (unsigned char)tag->name[0];
+            if (nameId == FT_FILENAME && isStringType(tag->type)) {
                 free(*outFilename);
-                *outFilename = sval;
-                sval = NULL;
-            } else if (nameId == FT_FILESIZE) {
-                *outFilesize = ival;
+                *outFilename = ownStrdup(tag->value.stringValue);
+            } else if (nameId == FT_FILESIZE && isIntType(tag->type)) {
+                *outFilesize = tag->value.intValue;
             }
         }
 
-        free(name);
-        free(sval);
+        freeMetaTag(tag);
     }
 }
 
@@ -460,31 +372,26 @@ static RefInfo readRefFromPartMet(const char *path) {
         if (ref.blockHashes == NULL && ref.numBlocks > 0) {
             err(EXIT_FAILURE, "Memory allocation error");
         }
-        for (unsigned int i = 0; i < ref.numBlocks; i++) {
-            readBytes(fd, ref.blockHashes[i], 16);
-        }
+        readBytes(fd, (unsigned char *)ref.blockHashes, (size_t)ref.numBlocks * 16);
         unsigned int numTags = readDWord(fd);
-        readAndExtractTags(fd, numTags, &ref.filename, &ref.filesize);
+        extractRefTags(fd, numTags, &ref.filename, &ref.filesize);
 
     } else if (verByte == PARTFILE_VERSION_14_1) {
         readByte(fd); /* unknown1 */
         readDWord(fd); /* date */
         readBytes(fd, ref.idHash, 16);
         unsigned int numTags = readDWord(fd);
-        readAndExtractTags(fd, numTags, &ref.filename, &ref.filesize);
+        extractRefTags(fd, numTags, &ref.filename, &ref.filesize);
 
         unsigned char haveHashes = readByte(fd);
         if (haveHashes == 1) {
-            unsigned int nblocks = (unsigned int)(ref.filesize / PARTSIZE);
-            if (ref.filesize % PARTSIZE != 0) nblocks++;
+            unsigned int nblocks = blocksForSize(ref.filesize);
             ref.numBlocks = nblocks;
             ref.blockHashes = malloc((size_t)nblocks * 16);
             if (ref.blockHashes == NULL && nblocks > 0) {
                 err(EXIT_FAILURE, "Memory allocation error");
             }
-            for (unsigned int i = 0; i < nblocks; i++) {
-                readBytes(fd, ref.blockHashes[i], 16);
-            }
+            readBytes(fd, (unsigned char *)ref.blockHashes, (size_t)nblocks * 16);
         } else {
             close(fd);
             errx(EXIT_FAILURE,
@@ -518,17 +425,6 @@ static RefInfo readRefFromPartMet(const char *path) {
 
 static int isEd2kLink(const char *s) {
     return strncasecmp(s, "ed2k://", 7) == 0;
-}
-
-/* strdup() is POSIX, not standard C99; provide our own to stay -std=c99 clean */
-static char *ownStrdup(const char *s) {
-    size_t len = strlen(s) + 1;
-    char *copy = (char *)malloc(len);
-    if (copy == NULL) {
-        err(EXIT_FAILURE, "Memory allocation error");
-    }
-    memcpy(copy, s, len);
-    return copy;
 }
 
 static int hexNibble(char c) {
@@ -684,6 +580,14 @@ static VerifyResult verifyBlocks(const RefInfo *ref, int dataFd, unsigned long l
         err(EXIT_FAILURE, "Memory allocation error");
     }
 
+    /* Blocks are read in increasing, contiguous order, and a full read
+     * already leaves the fd positioned at the next block's start - so
+     * lseek is only needed before the very first read and after a
+     * short read (which ends verification anyway, since blockStart
+     * will be >= dataSize for every later block). */
+    unsigned long long filePos = 0;
+    int positioned = 0;
+
     for (unsigned int i = 0; i < ref->numBlocks; i++) {
         unsigned long long blockStart = (unsigned long long)i * PARTSIZE;
         unsigned long long blockEnd = blockStart + PARTSIZE;
@@ -695,13 +599,18 @@ static VerifyResult verifyBlocks(const RefInfo *ref, int dataFd, unsigned long l
             unsigned long long available = dataSize - blockStart;
             unsigned long long toRead = available < blockLen ? available : blockLen;
 
-            if (lseek(dataFd, (off_t)blockStart, SEEK_SET) == (off_t)-1) {
-                err(EXIT_FAILURE, "Error seeking in data file");
+            if (!positioned || filePos != blockStart) {
+                if (lseek(dataFd, (off_t)blockStart, SEEK_SET) == (off_t)-1) {
+                    err(EXIT_FAILURE, "Error seeking in data file");
+                }
             }
             ssize_t got = read(dataFd, buf, (size_t)toRead);
             if (got < 0) {
                 err(EXIT_FAILURE, "Error reading data file");
             }
+            filePos = blockStart + (unsigned long long)got;
+            positioned = 1;
+
             if ((unsigned long long)got == blockLen) {
                 unsigned char digest[16];
                 md4Digest(buf, (size_t)blockLen, digest);
@@ -781,51 +690,77 @@ static void printVerifyReport(const RefInfo *ref, const VerifyResult *res, int j
 /* Rebuilding a valid .part.met                                       */
 /* ------------------------------------------------------------------ */
 
-static void writeStringTag(int fd, unsigned char nameId, const char *value) {
-    writeByte(fd, TAGTYPE_STRING);
-    writeWord(fd, 1);
-    writeByte(fd, nameId);
-    unsigned int len = (unsigned int)strlen(value);
-    writeWord(fd, (unsigned short)len);
-    writeBytes(fd, (const unsigned char *)value, len);
+/**
+ * Tag type for an integer value: the smallest of UINT32/UINT64 that
+ * fits, matching how aMule itself picks a tag's on-disk width.
+ */
+static int intTagType(unsigned long long value) {
+    return (value > 0xFFFFFFFFULL) ? TAGTYPE_UINT64 : TAGTYPE_UINT32;
 }
 
-static void writeIntTag(int fd, unsigned char nameId, unsigned long long value) {
+static void bufIntValue(ByteBuf *b, unsigned long long value) {
     if (value > 0xFFFFFFFFULL) {
-        writeByte(fd, TAGTYPE_UINT64);
-        writeWord(fd, 1);
-        writeByte(fd, nameId);
-        writeQWord(fd, value);
+        bufQWord(b, value);
     } else {
-        writeByte(fd, TAGTYPE_UINT32);
-        writeWord(fd, 1);
-        writeByte(fd, nameId);
-        writeDWord(fd, (unsigned int)value);
+        bufDWord(b, (unsigned int)value);
     }
 }
 
-static void writeGapTag(int fd, unsigned char startOrEnd, unsigned int refNum, unsigned long long pos) {
-    char refStr[16];
-    snprintf(refStr, sizeof(refStr), "%u", refNum);
-    unsigned int refLen = (unsigned int)strlen(refStr);
-    unsigned int nameLen = 1 + refLen;
+static void bufTagHeader(ByteBuf *b, int type, const unsigned char *nameBytes, unsigned int nameLen) {
+    bufByte(b, (unsigned char)type);
+    bufWord(b, (unsigned short)nameLen);
+    bufAppend(b, nameBytes, nameLen);
+}
 
-    if (pos > 0xFFFFFFFFULL) {
-        writeByte(fd, TAGTYPE_UINT64);
-        writeWord(fd, (unsigned short)nameLen);
-        writeByte(fd, startOrEnd);
-        writeBytes(fd, (const unsigned char *)refStr, refLen);
-        writeQWord(fd, pos);
-    } else {
-        writeByte(fd, TAGTYPE_UINT32);
-        writeWord(fd, (unsigned short)nameLen);
-        writeByte(fd, startOrEnd);
-        writeBytes(fd, (const unsigned char *)refStr, refLen);
-        writeDWord(fd, (unsigned int)pos);
-    }
+static void bufStringTag(ByteBuf *b, unsigned char nameId, const char *value) {
+    unsigned int len = (unsigned int)strlen(value);
+    bufTagHeader(b, TAGTYPE_STRING, &nameId, 1);
+    bufWord(b, (unsigned short)len);
+    bufAppend(b, value, len);
+}
+
+static void bufIntTag(ByteBuf *b, unsigned char nameId, unsigned long long value) {
+    bufTagHeader(b, intTagType(value), &nameId, 1);
+    bufIntValue(b, value);
+}
+
+static void bufGapTag(ByteBuf *b, unsigned char startOrEnd, unsigned int refNum, unsigned long long pos) {
+    char refStr[16];
+    int refLen = snprintf(refStr, sizeof(refStr), "%u", refNum);
+    unsigned char nameBytes[1 + sizeof(refStr)];
+    nameBytes[0] = startOrEnd;
+    memcpy(nameBytes + 1, refStr, (size_t)refLen);
+
+    bufTagHeader(b, intTagType(pos), nameBytes, 1 + (unsigned int)refLen);
+    bufIntValue(b, pos);
 }
 
 static void rebuildPartMet(const char *outPath, int force, const RefInfo *ref, const VerifyResult *res) {
+    ByteBuf buf;
+    bufInit(&buf);
+
+    unsigned char version = (ref->filesize > 0xFFFFFFFFULL) ? PARTFILE_VERSION_LARGEFILE : PARTFILE_VERSION_14_0;
+    bufByte(&buf, version);
+    bufDWord(&buf, (unsigned int)time(NULL));
+    bufAppend(&buf, ref->idHash, 16);
+    bufWord(&buf, (unsigned short)ref->numBlocks);
+    bufAppend(&buf, ref->blockHashes, (size_t)ref->numBlocks * 16);
+
+    size_t numTagsPos = buf.len;
+    bufDWord(&buf, 0); /* placeholder, patched once the real count is known */
+    unsigned int numTags = 0;
+
+    bufStringTag(&buf, FT_FILENAME, ref->filename); numTags++;
+    bufIntTag(&buf, FT_FILESIZE, ref->filesize); numTags++;
+    bufIntTag(&buf, FT_TRANSFERRED, res->verifiedBytes); numTags++;
+
+    for (unsigned int i = 0; i < res->numGaps; i++) {
+        bufGapTag(&buf, FT_GAPSTART, i, res->gaps[i].start); numTags++;
+        bufGapTag(&buf, FT_GAPEND, i, res->gaps[i].end); numTags++;
+    }
+
+    bufDWordAt(&buf, numTagsPos, numTags);
+
     int flags = O_WRONLY | O_CREAT | (force ? O_TRUNC : O_EXCL);
     int fd = open(outPath, flags, 0644);
     if (fd == -1) {
@@ -835,28 +770,9 @@ static void rebuildPartMet(const char *outPath, int force, const RefInfo *ref, c
         err(EXIT_FAILURE, "Unable to create output file %s", outPath);
     }
 
-    unsigned char version = (ref->filesize > 0xFFFFFFFFULL) ? PARTFILE_VERSION_LARGEFILE : PARTFILE_VERSION_14_0;
-    writeByte(fd, version);
-    writeDWord(fd, (unsigned int)time(NULL));
-    writeBytes(fd, ref->idHash, 16);
-    writeWord(fd, (unsigned short)ref->numBlocks);
-    for (unsigned int i = 0; i < ref->numBlocks; i++) {
-        writeBytes(fd, ref->blockHashes[i], 16);
-    }
-
-    unsigned int numTags = 3 + (res->numGaps * 2);
-    writeDWord(fd, numTags);
-
-    writeStringTag(fd, FT_FILENAME, ref->filename);
-    writeIntTag(fd, FT_FILESIZE, ref->filesize);
-    writeIntTag(fd, FT_TRANSFERRED, res->verifiedBytes);
-
-    for (unsigned int i = 0; i < res->numGaps; i++) {
-        writeGapTag(fd, 9, i, res->gaps[i].start);
-        writeGapTag(fd, 10, i, res->gaps[i].end);
-    }
-
+    bufFlushToFile(&buf, fd);
     close(fd);
+    bufFree(&buf);
 }
 
 /* ------------------------------------------------------------------ */

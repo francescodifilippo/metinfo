@@ -13,10 +13,10 @@ metinfo: metinfo.o
 metrepair: metrepair.o
 	$(CC) $(LDFLAGS) -o $@ $^
 
-metinfo.o: metinfo.c
+metinfo.o: metinfo.c metfmt.h
 	$(CC) $(CFLAGS) -c $<
 
-metrepair.o: metrepair.c
+metrepair.o: metrepair.c metfmt.h
 	$(CC) $(CFLAGS) -c $<
 
 clean:
