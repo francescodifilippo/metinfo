@@ -12,25 +12,74 @@
 #include <time.h>
 
 /**
+ * Meta Tag value types.
+ *
+ * 0x01/0x02/0x03 (Hash16/String/UInt32) are the ones described in the
+ * original ed2k .part.met format document (2003). The rest were added by
+ * eMule/aMule over time (see meta.md, section 4.4) and are read here for
+ * compatibility with current .part.met files, in particular the 0x0B
+ * (UInt64) type used for the FILESIZE tag of files larger than 4GB.
+ */
+#define TAGTYPE_HASH16    0x01
+#define TAGTYPE_STRING    0x02
+#define TAGTYPE_UINT32    0x03
+#define TAGTYPE_FLOAT32   0x04
+#define TAGTYPE_BOOL      0x05
+#define TAGTYPE_BOOLARRAY 0x06
+#define TAGTYPE_BLOB      0x07
+#define TAGTYPE_UINT16    0x08
+#define TAGTYPE_UINT8     0x09
+#define TAGTYPE_BSOB      0x0A
+#define TAGTYPE_UINT64    0x0B
+#define TAGTYPE_STR1      0x11
+#define TAGTYPE_STR16     0x20
+
+/**
+ * .part.met file format versions (first byte of the file).
+ */
+#define PARTFILE_VERSION_14_0      224 /* 0xE0 */
+#define PARTFILE_VERSION_14_1      225 /* 0xE1 */
+#define PARTFILE_VERSION_LARGEFILE 226 /* 0xE2 - same layout as 14.0, allows a 64-bit FILESIZE tag */
+
+/**
  * Structure to store a meta tag
  */
 typedef struct {
-    int type;             // 2=String, 3=Integer
-    int nameLength;       // Length of the name
-    char *name;           // Tag name
-    int valueLength;      // Length of the value (strings only)
+    int type;              // Tag type, see TAGTYPE_* above
+    int nameLength;         // Length of the name
+    char *name;             // Tag name
+    unsigned int valueLength; // Length of the value (String/Blob/Bsob/BoolArray)
     union {
-        char *stringValue;  // String value
-        int intValue;       // Integer value
+        char *stringValue;           // String (and compressed Str1..Str16)
+        unsigned long long intValue; // UInt8/UInt16/UInt32/UInt64/Bool
+        float floatValue;            // Float32
+        unsigned char hash[16];      // Hash16
+        unsigned char *blobValue;    // Blob/Bsob/BoolArray raw bytes
     } value;
 } MetaTag;
+
+/**
+ * Whether a tag type holds an integer-like value in value.intValue
+ */
+int isIntType(int type) {
+    return type == TAGTYPE_UINT8 || type == TAGTYPE_UINT16 ||
+           type == TAGTYPE_UINT32 || type == TAGTYPE_UINT64 ||
+           type == TAGTYPE_BOOL;
+}
+
+/**
+ * Whether a tag type holds a string value in value.stringValue
+ */
+int isStringType(int type) {
+    return type == TAGTYPE_STRING;
+}
 
 /**
  * Structure to store gap information
  */
 typedef struct {
-    unsigned int start;   // Gap start position (bytes)
-    unsigned int end;     // Gap end position (bytes)
+    unsigned long long start;   // Gap start position (bytes)
+    unsigned long long end;     // Gap end position (bytes)
 } GapInfo;
 
 /**
@@ -85,7 +134,7 @@ void usage(const char *progname) {
     fprintf(stderr, "  -d, --date           Show last seen complete date only\n");
     fprintf(stderr, "  -p, --progress       Show download progress only\n");
     fprintf(stderr, "  -e, --hash           Show ED2K hash only\n");
-    fprintf(stderr, "  -m, --metversion     Show .part.met version only (14.0 or 14.1)\n");
+    fprintf(stderr, "  -m, --metversion     Show .part.met version only (14.0, 14.1 or large-file 0xE2)\n");
     fprintf(stderr, "  -c, --tagcount       Show number of meta tags only\n");
     fprintf(stderr, "\nOutput format:\n");
     fprintf(stderr, "  -j, --json           Output in JSON format\n");
@@ -128,6 +177,34 @@ unsigned int readDWord(int fd) {
         err(EXIT_FAILURE, "Error reading file");
     }
     return (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24));
+}
+
+/**
+ * Read a qword (8 bytes) from the file
+ */
+unsigned long long readQWord(int fd) {
+    unsigned char bytes[8];
+    if (read(fd, bytes, 8) != 8) {
+        err(EXIT_FAILURE, "Error reading file");
+    }
+    unsigned long long value = 0;
+    for (int i = 7; i >= 0; i--) {
+        value = (value << 8) | bytes[i];
+    }
+    return value;
+}
+
+/**
+ * Read a 32-bit IEEE-754 float from the file
+ */
+float readFloat32(int fd) {
+    unsigned char bytes[4];
+    if (read(fd, bytes, 4) != 4) {
+        err(EXIT_FAILURE, "Error reading file");
+    }
+    float value;
+    memcpy(&value, bytes, sizeof(value));
+    return value;
 }
 
 /**
@@ -241,35 +318,125 @@ const char *getStandardTagDescription(const char *tagName) {
 
 /**
  * Read and parse a meta tag from the file
+ *
+ * Supports the classic String/Integer tags from the original format
+ * document as well as the extra types used by current aMule/eMule
+ * .part.met files (Hash16, Float32, Bool, BoolArray, Blob, UInt16,
+ * UInt8, BSOB, UInt64, and the compressed Str1..Str16 strings). See
+ * meta.md section 4.4 for the byte layout of each type.
  */
 MetaTag *readMetaTag(int fd) {
     MetaTag *tag = (MetaTag *)malloc(sizeof(MetaTag));
     if (tag == NULL) {
         err(EXIT_FAILURE, "Memory allocation error");
     }
-    
+    tag->valueLength = 0;
+
     // Read tag type
     tag->type = readByte(fd);
-    
+
     // Read name length
     tag->nameLength = readWord(fd);
-    
+
     // Read name
     tag->name = readString(fd, tag->nameLength);
-    
+
     // Read value based on type
-    if (tag->type == 2) { // String
-        tag->valueLength = readWord(fd);
-        tag->value.stringValue = readString(fd, tag->valueLength);
-    } else if (tag->type == 3) { // Integer
-        tag->value.intValue = readDWord(fd);
-    } else {
-        fprintf(stderr, "Error: Unrecognized tag type: %d\n", tag->type);
-        free(tag->name);
-        free(tag);
-        return NULL;
+    switch (tag->type) {
+        case TAGTYPE_HASH16:
+            if (read(fd, tag->value.hash, 16) != 16) {
+                err(EXIT_FAILURE, "Error reading hash tag value");
+            }
+            tag->valueLength = 16;
+            break;
+
+        case TAGTYPE_STRING:
+            tag->valueLength = readWord(fd);
+            tag->value.stringValue = readString(fd, tag->valueLength);
+            break;
+
+        case TAGTYPE_UINT8:
+            tag->value.intValue = readByte(fd);
+            break;
+
+        case TAGTYPE_UINT16:
+            tag->value.intValue = readWord(fd);
+            break;
+
+        case TAGTYPE_UINT32:
+            tag->value.intValue = readDWord(fd);
+            break;
+
+        case TAGTYPE_UINT64:
+            tag->value.intValue = readQWord(fd);
+            break;
+
+        case TAGTYPE_BOOL:
+            tag->value.intValue = readByte(fd);
+            break;
+
+        case TAGTYPE_FLOAT32:
+            tag->value.floatValue = readFloat32(fd);
+            break;
+
+        case TAGTYPE_BOOLARRAY: {
+            // eMule/aMule encode a 2-byte bit count followed by
+            // (bits/8)+1 packed bytes (off-by-one kept for compatibility
+            // with eMule versions prior to 0.42e.29).
+            unsigned short bitLen = readWord(fd);
+            unsigned int byteLen = (unsigned int)(bitLen / 8) + 1;
+            tag->valueLength = bitLen;
+            tag->value.blobValue = (unsigned char *)malloc(byteLen);
+            if (tag->value.blobValue == NULL) {
+                err(EXIT_FAILURE, "Memory allocation error");
+            }
+            if (read(fd, tag->value.blobValue, byteLen) != (ssize_t)byteLen) {
+                err(EXIT_FAILURE, "Error reading bool array tag value");
+            }
+            break;
+        }
+
+        case TAGTYPE_BLOB:
+            tag->valueLength = readDWord(fd);
+            tag->value.blobValue = (unsigned char *)malloc(tag->valueLength > 0 ? tag->valueLength : 1);
+            if (tag->value.blobValue == NULL) {
+                err(EXIT_FAILURE, "Memory allocation error");
+            }
+            if (tag->valueLength > 0 &&
+                read(fd, tag->value.blobValue, tag->valueLength) != (ssize_t)tag->valueLength) {
+                err(EXIT_FAILURE, "Error reading blob tag value");
+            }
+            break;
+
+        case TAGTYPE_BSOB: {
+            unsigned char bsobSize = readByte(fd);
+            tag->valueLength = bsobSize;
+            tag->value.blobValue = (unsigned char *)malloc(bsobSize > 0 ? bsobSize : 1);
+            if (tag->value.blobValue == NULL) {
+                err(EXIT_FAILURE, "Memory allocation error");
+            }
+            if (bsobSize > 0 && read(fd, tag->value.blobValue, bsobSize) != bsobSize) {
+                err(EXIT_FAILURE, "Error reading bsob tag value");
+            }
+            break;
+        }
+
+        default:
+            if (tag->type >= TAGTYPE_STR1 && tag->type <= TAGTYPE_STR16) {
+                // Compressed string tag: the value length is encoded in
+                // the type itself, there is no length prefix on disk.
+                int len = tag->type - TAGTYPE_STR1 + 1;
+                tag->valueLength = (unsigned int)len;
+                tag->value.stringValue = readString(fd, len);
+                tag->type = TAGTYPE_STRING; // normalize for the rest of the program
+            } else {
+                fprintf(stderr, "Error: Unrecognized tag type: 0x%02X\n", tag->type);
+                free(tag->name);
+                free(tag);
+                return NULL;
+            }
     }
-    
+
     return tag;
 }
 
@@ -279,8 +446,11 @@ MetaTag *readMetaTag(int fd) {
 void freeMetaTag(MetaTag *tag) {
     if (tag != NULL) {
         free(tag->name);
-        if (tag->type == 2) { // String
+        if (isStringType(tag->type)) {
             free(tag->value.stringValue);
+        } else if (tag->type == TAGTYPE_BLOB || tag->type == TAGTYPE_BSOB ||
+                   tag->type == TAGTYPE_BOOLARRAY) {
+            free(tag->value.blobValue);
         }
         free(tag);
     }
@@ -392,14 +562,73 @@ char *jsonEscapeString(const char *str) {
 }
 
 /**
+ * Print a 16-byte hash as uppercase hex
+ */
+void printHashHex(const unsigned char *hash) {
+    for (int i = 0; i < 16; i++) {
+        printf("%02X", hash[i]);
+    }
+}
+
+/**
+ * Print the value of a tag whose type is neither the classic String nor
+ * an integer type (Hash16, Float32, Blob, BSOB, BoolArray). Used as the
+ * fallback branch wherever the code used to assume "integer or string".
+ */
+void printBinaryTagValueText(MetaTag *tag) {
+    switch (tag->type) {
+        case TAGTYPE_HASH16:
+            printf("0x");
+            printHashHex(tag->value.hash);
+            break;
+        case TAGTYPE_FLOAT32:
+            printf("%f", tag->value.floatValue);
+            break;
+        case TAGTYPE_BLOB:
+        case TAGTYPE_BSOB:
+            printf("<binary data, %u bytes>", tag->valueLength);
+            break;
+        case TAGTYPE_BOOLARRAY:
+            printf("<bool array, %u bits>", tag->valueLength);
+            break;
+        default:
+            printf("<unsupported tag type 0x%02X>", tag->type);
+            break;
+    }
+}
+
+void printBinaryTagValueJSON(MetaTag *tag) {
+    switch (tag->type) {
+        case TAGTYPE_HASH16:
+            printf("\"");
+            printHashHex(tag->value.hash);
+            printf("\"");
+            break;
+        case TAGTYPE_FLOAT32:
+            printf("%f", tag->value.floatValue);
+            break;
+        case TAGTYPE_BLOB:
+        case TAGTYPE_BSOB:
+            printf("{\"binary\":true,\"size\":%u}", tag->valueLength);
+            break;
+        case TAGTYPE_BOOLARRAY:
+            printf("{\"boolarray\":true,\"bits\":%u}", tag->valueLength);
+            break;
+        default:
+            printf("null");
+            break;
+    }
+}
+
+/**
  * Print meta tag information with optional verbosity
  */
 void printMetaTag(MetaTag *tag, int verbose, int json_output) {
     int tagType = determineTagType(tag);
-    
+
     if (json_output) {
         printf("{\"type\":");
-        
+
         // Tag type
         switch (tagType) {
             case 1: printf("\"special\""); break;
@@ -407,12 +636,12 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
             case 3: printf("\"standard\""); break;
             case 4: printf("\"unknown\""); break;
         }
-        
+
         // Tag ID for special tags
         if (tagType == 1) {
             printf(",\"id\":%d", (unsigned char)tag->name[0]);
         }
-        
+
         // Tag name for non-special tags
         if (tagType != 1) {
             if (tagType == 2) {
@@ -426,7 +655,7 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
                 } else {
                     printf("\"unknown\"");
                 }
-                
+
                 // Extract reference number
                 if (tag->nameLength > 1) {
                     char refNum[tag->nameLength];
@@ -439,56 +668,59 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
                 char tagName[tag->nameLength + 1];
                 memcpy(tagName, tag->name, tag->nameLength);
                 tagName[tag->nameLength] = '\0';
-                
+
                 char *escapedName = jsonEscapeString(tagName);
                 printf(",\"name\":\"%s\"", escapedName ? escapedName : "");
                 free(escapedName);
             }
         }
-        
+
         // Description for known tags
         if (tagType == 1) {
-            const char *desc = getSpecialTagDescription((unsigned char)tag->name[0], 
-                                                       tag->type == 3 ? tag->value.intValue : 0);
+            const char *desc = getSpecialTagDescription((unsigned char)tag->name[0],
+                                                       isIntType(tag->type) ? (int)tag->value.intValue : 0);
             if (desc) {
                 char *escapedDesc = jsonEscapeString(desc);
                 printf(",\"description\":\"%s\"", escapedDesc ? escapedDesc : "");
                 free(escapedDesc);
             }
         }
-        
+
         // Value
-        if (tag->type == 3) { // Integer
-            printf(",\"value\":%d", tag->value.intValue);
-            
+        if (isIntType(tag->type)) {
+            printf(",\"value\":%llu", tag->value.intValue);
+
             // Add additional info for certain special tags
             if (tagType == 1) {
                 unsigned char nameValue = tag->name[0];
                 if (nameValue == 2 || nameValue == 8) { // File size or downloaded bytes
                     printf(",\"value_mb\":%.2f", tag->value.intValue / 1048576.0);
                 } else if (nameValue == 5) { // Last seen date
-                    printf(",\"value_date\":\"%s\"", formatTimestamp(tag->value.intValue));
+                    printf(",\"value_date\":\"%s\"", formatTimestamp((unsigned int)tag->value.intValue));
                 }
             }
-        } else { // String
+        } else if (isStringType(tag->type)) {
             char *escapedValue = jsonEscapeString(tag->value.stringValue);
             printf(",\"value\":\"%s\"", escapedValue ? escapedValue : "");
             free(escapedValue);
+        } else {
+            printf(",\"value\":");
+            printBinaryTagValueJSON(tag);
         }
-        
+
         printf("}");
     } else {
         // Special tag (1-byte name)
         if (tagType == 1) {
             unsigned char nameValue = tag->name[0];
             printf("Tag: (Special, %d) ", nameValue);
-            
+
             const char *desc = NULL;
-            if (tag->type == 3) { // Integer
-                desc = getSpecialTagDescription(nameValue, tag->value.intValue);
+            if (isIntType(tag->type)) {
+                desc = getSpecialTagDescription(nameValue, (int)tag->value.intValue);
                 if (desc) {
-                    printf("%s = %d", desc, tag->value.intValue);
-                    
+                    printf("%s = %llu", desc, tag->value.intValue);
+
                     // Extra details for certain special tags in verbose mode
                     if (verbose) {
                         if (nameValue == 2) { // File size
@@ -496,7 +728,7 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
                         } else if (nameValue == 8) { // Downloaded bytes
                             printf(" (%.2f MB)", tag->value.intValue / 1048576.0);
                         } else if (nameValue == 5) { // Last seen date
-                            printf(" (%s)", formatTimestamp(tag->value.intValue));
+                            printf(" (%s)", formatTimestamp((unsigned int)tag->value.intValue));
                         } else if (nameValue == 20) { // Status
                             switch(tag->value.intValue) {
                                 case 0: printf(" - File is ready for download"); break;
@@ -506,15 +738,19 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
                         }
                     }
                 } else {
-                    printf("Name: %d, Value: %d", nameValue, tag->value.intValue);
+                    printf("Name: %d, Value: %llu", nameValue, tag->value.intValue);
                 }
-            } else { // String
+            } else if (isStringType(tag->type)) {
                 desc = getSpecialTagDescription(nameValue, 0);
                 if (desc) {
                     printf("%s = \"%s\"", desc, tag->value.stringValue);
                 } else {
                     printf("Name: %d, Value: \"%s\"", nameValue, tag->value.stringValue);
                 }
+            } else {
+                desc = getSpecialTagDescription(nameValue, 0);
+                printf("%s = ", desc ? desc : "Value");
+                printBinaryTagValueText(tag);
             }
         }
         // Gap tag
@@ -525,16 +761,19 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
                 char refNum[tag->nameLength];
                 memcpy(refNum, tag->name + 1, tag->nameLength - 1);
                 refNum[tag->nameLength - 1] = '\0';
-                
+
                 printf("Tag: (Gap) %s, Reference: %s", desc, refNum);
-                
-                if (tag->type == 3) { // Integer
-                    printf(", Value: %d", tag->value.intValue);
+
+                if (isIntType(tag->type)) {
+                    printf(", Value: %llu", tag->value.intValue);
                     if (verbose) {
                         printf(" (%.2f MB)", tag->value.intValue / 1048576.0);
                     }
-                } else { // String
+                } else if (isStringType(tag->type)) {
                     printf(", Value: \"%s\"", tag->value.stringValue);
+                } else {
+                    printf(", Value: ");
+                    printBinaryTagValueText(tag);
                 }
             } else {
                 printf("Tag: Unrecognized gap tag");
@@ -546,28 +785,33 @@ void printMetaTag(MetaTag *tag, int verbose, int json_output) {
             char tagName[tag->nameLength + 1];
             memcpy(tagName, tag->name, tag->nameLength);
             tagName[tag->nameLength] = '\0';
-            
+
             const char *desc = getStandardTagDescription(tagName);
             if (desc) {
                 printf("Tag: (Standard) %s = ", tagName);
-                if (tag->type == 3) { // Integer
-                    printf("%d", tag->value.intValue);
-                } else { // String
+                if (isIntType(tag->type)) {
+                    printf("%llu", tag->value.intValue);
+                } else if (isStringType(tag->type)) {
                     printf("\"%s\"", tag->value.stringValue);
+                } else {
+                    printBinaryTagValueText(tag);
                 }
                 if (verbose) {
                     printf(" - %s", desc);
                 }
             } else {
                 printf("Tag: (Unknown) Name: \"%s\", ", tagName);
-                if (tag->type == 3) { // Integer
-                    printf("Value: %d", tag->value.intValue);
-                } else { // String
+                if (isIntType(tag->type)) {
+                    printf("Value: %llu", tag->value.intValue);
+                } else if (isStringType(tag->type)) {
                     printf("Value: \"%s\"", tag->value.stringValue);
+                } else {
+                    printf("Value: ");
+                    printBinaryTagValueText(tag);
                 }
             }
         }
-        
+
         printf("\n");
     }
 }
@@ -581,7 +825,7 @@ void displaySpecificField(MetaTag **tags, int numTags, int fieldType, int verbos
         if (tags[i]->nameLength == 1 && tags[i]->name[0] == fieldType) {
             switch (fieldType) {
                 case 1: // Filename
-                    if (tags[i]->type == 2) {
+                    if (isStringType(tags[i]->type)) {
                         if (json_output) {
                             char *escapedValue = jsonEscapeString(tags[i]->value.stringValue);
                             printf("{\"filename\":\"%s\"}", escapedValue ? escapedValue : "");
@@ -591,34 +835,34 @@ void displaySpecificField(MetaTag **tags, int numTags, int fieldType, int verbos
                         }
                     }
                     break;
-                    
+
                 case 2: // File size
-                    if (tags[i]->type == 3) {
+                    if (isIntType(tags[i]->type)) {
                         if (json_output) {
-                            printf("{\"filesize\":%u", tags[i]->value.intValue);
+                            printf("{\"filesize\":%llu", tags[i]->value.intValue);
                             if (verbose) {
                                 printf(",\"filesize_mb\":%.2f", tags[i]->value.intValue / 1048576.0);
                             }
                             printf("}");
                         } else {
-                            printf("%u", tags[i]->value.intValue);
+                            printf("%llu", tags[i]->value.intValue);
                         }
                     }
                     break;
-                    
+
                 case 5: // Last seen date
-                    if (tags[i]->type == 3) {
+                    if (isIntType(tags[i]->type)) {
                         if (json_output) {
-                            printf("{\"last_seen\":%u", tags[i]->value.intValue);
+                            printf("{\"last_seen\":%llu", tags[i]->value.intValue);
                             if (verbose) {
-                                printf(",\"last_seen_date\":\"%s\"", formatTimestamp(tags[i]->value.intValue));
+                                printf(",\"last_seen_date\":\"%s\"", formatTimestamp((unsigned int)tags[i]->value.intValue));
                             }
                             printf("}");
                         } else {
                             if (verbose) {
-                                printf("%s", formatTimestamp(tags[i]->value.intValue));
+                                printf("%s", formatTimestamp((unsigned int)tags[i]->value.intValue));
                             } else {
-                                printf("%u", tags[i]->value.intValue);
+                                printf("%llu", tags[i]->value.intValue);
                             }
                         }
                     }
@@ -628,7 +872,7 @@ void displaySpecificField(MetaTag **tags, int numTags, int fieldType, int verbos
             return;
         }
     }
-    
+
     // Field not found
     if (json_output) {
         switch (fieldType) {
@@ -650,14 +894,14 @@ void displaySpecificField(MetaTag **tags, int numTags, int fieldType, int verbos
 /**
  * Display download progress information
  */
-void displayProgress(unsigned int fileSize, unsigned int downloadedBytes, int json_output) {
+void displayProgress(unsigned long long fileSize, unsigned long long downloadedBytes, int json_output) {
     double percentage = 0.0;
     if (fileSize > 0) {
         percentage = (downloadedBytes * 100.0) / fileSize;
     }
-    
+
     if (json_output) {
-        printf("{\"total_bytes\":%u,\"downloaded_bytes\":%u,\"total_mb\":%.2f,\"downloaded_mb\":%.2f,\"percentage\":%.1f}",
+        printf("{\"total_bytes\":%llu,\"downloaded_bytes\":%llu,\"total_mb\":%.2f,\"downloaded_mb\":%.2f,\"percentage\":%.1f}",
                fileSize, downloadedBytes,
                fileSize / 1048576.0, downloadedBytes / 1048576.0,
                percentage);
@@ -673,46 +917,46 @@ void displayProgress(unsigned int fileSize, unsigned int downloadedBytes, int js
 GapInfo* collectGaps(MetaTag **tags, int numTags, int *numGaps) {
     GapInfo *gaps = NULL;
     int gapCount = 0;
-    
+
     // First, count the number of gap pairs
     for (int i = 0; i < numTags; i++) {
         if (tags[i]->nameLength >= 2 && tags[i]->name[0] == 9) { // Start of gap
             gapCount++;
         }
     }
-    
+
     // Allocate memory for gaps
     gaps = (GapInfo *)malloc(gapCount * sizeof(GapInfo));
     if (gaps == NULL && gapCount > 0) {
         err(EXIT_FAILURE, "Memory allocation error");
     }
-    
+
     // Match start and end gaps
     int gapIndex = 0;
     for (int i = 0; i < numTags; i++) {
         // Find start gap tag
-        if (tags[i]->nameLength >= 2 && tags[i]->name[0] == 9 && tags[i]->type == 3) {
+        if (tags[i]->nameLength >= 2 && tags[i]->name[0] == 9 && isIntType(tags[i]->type)) {
             char refNum[tags[i]->nameLength];
             memcpy(refNum, tags[i]->name + 1, tags[i]->nameLength - 1);
             refNum[tags[i]->nameLength - 1] = '\0';
-            
-            unsigned int startPos = tags[i]->value.intValue;
-            unsigned int endPos = 0;
-            
+
+            unsigned long long startPos = tags[i]->value.intValue;
+            unsigned long long endPos = 0;
+
             // Find matching end gap
             for (int j = 0; j < numTags; j++) {
-                if (tags[j]->nameLength >= 2 && tags[j]->name[0] == 10 && tags[j]->type == 3) {
+                if (tags[j]->nameLength >= 2 && tags[j]->name[0] == 10 && isIntType(tags[j]->type)) {
                     char endRefNum[tags[j]->nameLength];
                     memcpy(endRefNum, tags[j]->name + 1, tags[j]->nameLength - 1);
                     endRefNum[tags[j]->nameLength - 1] = '\0';
-                    
+
                     if (strcmp(refNum, endRefNum) == 0) {
                         endPos = tags[j]->value.intValue;
                         break;
                     }
                 }
             }
-            
+
             if (endPos > 0 && gapIndex < gapCount) {
                 gaps[gapIndex].start = startPos;
                 gaps[gapIndex].end = endPos;
@@ -720,7 +964,7 @@ GapInfo* collectGaps(MetaTag **tags, int numTags, int *numGaps) {
             }
         }
     }
-    
+
     *numGaps = gapIndex;
     return gaps;
 }
@@ -728,43 +972,43 @@ GapInfo* collectGaps(MetaTag **tags, int numTags, int *numGaps) {
 /**
  * Visualize file download status with gaps
  */
-void visualizeFileStatus(GapInfo *gaps, int numGaps, unsigned int fileSize, unsigned int downloadedBytes, int json_output) {
+void visualizeFileStatus(GapInfo *gaps, int numGaps, unsigned long long fileSize, unsigned long long downloadedBytes, int json_output) {
     const int barWidth = 70; // Width of visualization bar
-    
+
     if (json_output) {
         printf("{\"visualization\":{");
-        printf("\"total_size\":%u,\"total_size_mb\":%.2f,", fileSize, fileSize / 1048576.0);
-        printf("\"downloaded\":%u,\"downloaded_mb\":%.2f,", downloadedBytes, downloadedBytes / 1048576.0);
+        printf("\"total_size\":%llu,\"total_size_mb\":%.2f,", fileSize, fileSize / 1048576.0);
+        printf("\"downloaded\":%llu,\"downloaded_mb\":%.2f,", downloadedBytes, downloadedBytes / 1048576.0);
         double perc = 0.0;
         if (fileSize > 0) {
             perc = (downloadedBytes * 100.0) / fileSize;
         }
         printf("\"percentage\":%.1f,", perc);
-        
+
         // Gap statistics
         printf("\"gaps\":{\"count\":%d,", numGaps);
-        
+
         if (numGaps > 0) {
-            unsigned int totalGapSize = 0;
+            unsigned long long totalGapSize = 0;
             for (int i = 0; i < numGaps; i++) {
                 totalGapSize += (gaps[i].end - gaps[i].start);
             }
-            
+
             double gapPerc = 0.0;
             if (fileSize > 0) {
                 gapPerc = (totalGapSize * 100.0) / fileSize;
             }
-            printf("\"total_size\":%u,\"total_size_mb\":%.2f,\"percentage\":%.1f,",
+            printf("\"total_size\":%llu,\"total_size_mb\":%.2f,\"percentage\":%.1f,",
                    totalGapSize, totalGapSize / 1048576.0, gapPerc);
-            
+
             // Add gap details
             printf("\"details\":[");
             for (int i = 0; i < numGaps; i++) {
-                printf("{\"start\":%u,\"end\":%u,\"size\":%u,\"size_mb\":%.2f}",
+                printf("{\"start\":%llu,\"end\":%llu,\"size\":%llu,\"size_mb\":%.2f}",
                        gaps[i].start, gaps[i].end,
                        gaps[i].end - gaps[i].start,
                        (gaps[i].end - gaps[i].start) / 1048576.0);
-                
+
                 if (i < numGaps - 1) {
                     printf(",");
                 }
@@ -773,16 +1017,16 @@ void visualizeFileStatus(GapInfo *gaps, int numGaps, unsigned int fileSize, unsi
         } else {
             printf("\"total_size\":0,\"total_size_mb\":0.0,\"percentage\":0.0,\"details\":[]");
         }
-        
+
         printf("}");  // Close gaps object
-        
+
         // Visual representation as array
         printf(",\"bar\":[");
         for (int i = 0; i < barWidth; i++) {
             // Calculate file position this bar position represents
-            unsigned int posStart = (unsigned int)((i / (double)barWidth) * fileSize);
-            unsigned int posEnd = (unsigned int)(((i + 1) / (double)barWidth) * fileSize);
-            
+            unsigned long long posStart = (unsigned long long)((i / (double)barWidth) * fileSize);
+            unsigned long long posEnd = (unsigned long long)(((i + 1) / (double)barWidth) * fileSize);
+
             // Check if this position is in a gap
             int inGap = 0;
             for (int j = 0; j < numGaps; j++) {
@@ -803,27 +1047,27 @@ void visualizeFileStatus(GapInfo *gaps, int numGaps, unsigned int fileSize, unsi
         printf("}}");  // Close visualization and outer objects
     } else {
         printf("\n=== FILE DOWNLOAD VISUALIZATION ===\n");
-        
+
         // Show basic info
-        printf("Total size: %u bytes (%.2f MB)\n", fileSize, fileSize / 1048576.0);
+        printf("Total size: %llu bytes (%.2f MB)\n", fileSize, fileSize / 1048576.0);
         double perc = 0.0;
         if (fileSize > 0) {
             perc = (downloadedBytes * 100.0) / fileSize;
         }
-        printf("Downloaded: %u bytes (%.2f MB, %.1f%%)\n",
+        printf("Downloaded: %llu bytes (%.2f MB, %.1f%%)\n",
                downloadedBytes,
                downloadedBytes / 1048576.0,
                perc);
-        
+
         // Draw progress bar
         printf("[");
-        
+
         // For each position in the progress bar
         for (int i = 0; i < barWidth; i++) {
             // Calculate file position this bar position represents
-            unsigned int posStart = (unsigned int)((i / (double)barWidth) * fileSize);
-            unsigned int posEnd = (unsigned int)(((i + 1) / (double)barWidth) * fileSize);
-            
+            unsigned long long posStart = (unsigned long long)((i / (double)barWidth) * fileSize);
+            unsigned long long posEnd = (unsigned long long)(((i + 1) / (double)barWidth) * fileSize);
+
             // Check if this position is in a gap
             int inGap = 0;
             for (int j = 0; j < numGaps; j++) {
@@ -833,7 +1077,7 @@ void visualizeFileStatus(GapInfo *gaps, int numGaps, unsigned int fileSize, unsi
                     break;
                 }
             }
-            
+
             // Print character based on gap status
             if (inGap) {
                 printf(" "); // Gap/missing part
@@ -841,19 +1085,19 @@ void visualizeFileStatus(GapInfo *gaps, int numGaps, unsigned int fileSize, unsi
                 printf("#"); // Downloaded part
             }
         }
-        
+
         printf("]\n\n");
-        
+
         // Show gap statistics
         if (numGaps > 0) {
             printf("Gaps: %d\n", numGaps);
-            
+
             // Calculate total gap size
-            unsigned int totalGapSize = 0;
+            unsigned long long totalGapSize = 0;
             for (int i = 0; i < numGaps; i++) {
                 totalGapSize += (gaps[i].end - gaps[i].start);
             }
-            
+
             double gapPerc = 0.0;
             if (fileSize > 0) {
                 gapPerc = (totalGapSize * 100.0) / fileSize;
@@ -876,8 +1120,8 @@ int main(int argc, char **argv) {
     int starthash = 5;
     int show_version = 0;
     int metVersion = 0;
-    unsigned int fileSize = 0;
-    unsigned int downloadedBytes = 0;
+    unsigned long long fileSize = 0;
+    unsigned long long downloadedBytes = 0;
     
     // Default options
     ProgramOptions options = {
@@ -1047,7 +1291,7 @@ int main(int argc, char **argv) {
     // Determine hash position based on file version
     char *versionStr = NULL;
     switch ((int)buffer[0] & 0xff) {
-        case 224:
+        case PARTFILE_VERSION_14_0:
             starthash = 5;
             metVersion = 0; // Version 14.0
             versionStr = "14.0";
@@ -1073,7 +1317,7 @@ int main(int argc, char **argv) {
                 printf(".part.met file version: %s\n", versionStr);
             }
             break;
-        case 225:
+        case PARTFILE_VERSION_14_1:
             starthash = 6;
             metVersion = 1; // Version 14.1
             versionStr = "14.1";
@@ -1087,14 +1331,43 @@ int main(int argc, char **argv) {
                 free(buffer);
                 close(fd);
                 return EXIT_SUCCESS;
-            } else if (options.json_output && 
-                      !(options.show_hash || options.show_tagcount || 
-                        options.show_filename || options.show_filesize || 
+            } else if (options.json_output &&
+                      !(options.show_hash || options.show_tagcount ||
+                        options.show_filename || options.show_filesize ||
                         options.show_date || options.show_progress)) {
                 printf("\"format_version\":\"%s\",", versionStr);
-            } else if (!options.json_output && 
-                      !(options.show_hash || options.show_tagcount || 
-                        options.show_filename || options.show_filesize || 
+            } else if (!options.json_output &&
+                      !(options.show_hash || options.show_tagcount ||
+                        options.show_filename || options.show_filesize ||
+                        options.show_date || options.show_progress)) {
+                printf(".part.met file version: %s\n", versionStr);
+            }
+            break;
+        case PARTFILE_VERSION_LARGEFILE:
+            // Same header layout as 14.0 (version, date, hash, blocks,
+            // hashes, tags); the version byte just signals that the
+            // FILESIZE tag may be a 64-bit integer. See meta.md 4.4.
+            starthash = 5;
+            metVersion = 0;
+            versionStr = "14.0-LF (large file, 0xE2)";
+            if (options.show_metversion) {
+                // Output only the version number when specifically requested
+                if (options.json_output) {
+                    printf("{\"format_version\":\"%s\"}", versionStr);
+                } else {
+                    printf("%s", versionStr);
+                }
+                free(buffer);
+                close(fd);
+                return EXIT_SUCCESS;
+            } else if (options.json_output &&
+                      !(options.show_hash || options.show_tagcount ||
+                        options.show_filename || options.show_filesize ||
+                        options.show_date || options.show_progress)) {
+                printf("\"format_version\":\"%s\",", versionStr);
+            } else if (!options.json_output &&
+                      !(options.show_hash || options.show_tagcount ||
+                        options.show_filename || options.show_filesize ||
                         options.show_date || options.show_progress)) {
                 printf(".part.met file version: %s\n", versionStr);
             }
@@ -1242,10 +1515,12 @@ int main(int argc, char **argv) {
         }
         
         // Keep track of file size and downloaded bytes for visualization
+        // (isIntType() covers UInt8/16/32/64, so this also picks up the
+        // 64-bit FILESIZE tag used by large files, see meta.md 4.4)
         if (tags[i]->nameLength == 1) {
-            if (tags[i]->name[0] == 2 && tags[i]->type == 3) { // File size
+            if (tags[i]->name[0] == 2 && isIntType(tags[i]->type)) { // File size
                 fileSize = tags[i]->value.intValue;
-            } else if (tags[i]->name[0] == 8 && tags[i]->type == 3) { // Downloaded bytes
+            } else if (tags[i]->name[0] == 8 && isIntType(tags[i]->type)) { // Downloaded bytes
                 downloadedBytes = tags[i]->value.intValue;
             }
         }
